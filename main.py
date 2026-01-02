@@ -423,10 +423,106 @@ def get_stock_price(stock_id):
         df['MA10'] = df['Close'].rolling(window=10).mean()
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
-        
+
         return df
     except Exception:
         return None
+
+
+def build_strategy_notes(merged_df, df_price, rank_start_date, rank_end_date):
+    """根據分點籌碼與股價位置，產生簡短的策略備註。"""
+
+    def add_note(unique_notes, text):
+        if text and text not in unique_notes:
+            unique_notes.append(text)
+
+    notes = []
+
+    base_df = merged_df if merged_df is not None and not merged_df.empty else df_price
+    if base_df is None or base_df.empty:
+        return ["暫無足夠資料產生策略備註。"]
+
+    df = base_df.copy()
+    df["Date"] = pd.to_datetime(df.get("DateStr"), errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date")
+
+    last_row = df.iloc[-1]
+    last_close = pd.to_numeric(last_row.get("Close"), errors="coerce")
+    ma20 = pd.to_numeric(last_row.get("MA20"), errors="coerce")
+    ma60 = pd.to_numeric(last_row.get("MA60"), errors="coerce")
+
+    # 1) 股價位置與均線排列
+    if pd.notna(last_close) and pd.notna(ma20) and pd.notna(ma60):
+        if last_close >= ma20 >= ma60:
+            add_note(notes, "股價在月/季線之上，均線多頭排列，偏多續看。")
+        elif last_close >= ma20 and last_close < ma60:
+            add_note(notes, "股價介於月線與季線，短線撐在月線但中期仍需觀察。")
+        elif last_close >= ma60 and last_close < ma20:
+            add_note(notes, "股價站季線但壓在月線下，若能回到月線上方偏多。")
+        else:
+            add_note(notes, "股價跌破月/季線，下檔需嚴控風險或等待止穩。")
+    elif pd.notna(last_close) and pd.notna(ma20):
+        add_note(notes, "股價相對月線仍具參考價值，建議密切追蹤月線攻防。")
+
+    # 均線角度輔助判斷（使用近 5 日斜率）
+    if len(df) >= 6 and pd.notna(df["MA20"].iloc[-1]):
+        ma20_slope = pd.to_numeric(df["MA20"].iloc[-1] - df["MA20"].iloc[-6], errors="coerce")
+        if pd.notna(ma20_slope):
+            if ma20_slope > 0:
+                add_note(notes, "月線近一週走升，趨勢動能偏正向。")
+            elif ma20_slope < 0:
+                add_note(notes, "月線近一週下彎，攻擊需提防轉弱。")
+
+    # 2) 分點買賣超趨勢
+    if merged_df is not None and not merged_df.empty and "買賣超_Final" in merged_df.columns:
+        df_broker = merged_df.copy()
+        df_broker["Date"] = pd.to_datetime(df_broker.get("DateStr"), errors="coerce")
+        df_broker = df_broker.dropna(subset=["Date"]).sort_values("Date")
+        df_broker["買賣超_Final"] = pd.to_numeric(df_broker.get("買賣超_Final", 0), errors="coerce").fillna(0)
+        df_broker["cumulative_net"] = pd.to_numeric(df_broker.get("cumulative_net", 0), errors="coerce")
+
+        # 近五日資金
+        recent_5 = df_broker.tail(5)["買賣超_Final"].sum()
+        if recent_5 > 0:
+            add_note(notes, f"近五日累計買超 {recent_5:,.0f} 張，短線資金偏多。")
+        elif recent_5 < 0:
+            add_note(notes, f"近五日累計賣超 {abs(recent_5):,.0f} 張，短線偏空或獲利了結。")
+
+        # 連續買賣超判讀
+        tail_net = df_broker["買賣超_Final"].tail(3)
+        if len(tail_net) == 3:
+            if (tail_net > 0).all():
+                add_note(notes, "分點連續 3 日買超，觀察是否帶動股價同步走高。")
+            elif (tail_net < 0).all():
+                add_note(notes, "分點連續 3 日賣超，留意籌碼鬆動或短線修正。")
+
+        # 排名區間籌碼
+        if rank_start_date and rank_end_date:
+            rank_mask = (
+                df_broker["DateStr"] >= rank_start_date
+            ) & (
+                df_broker["DateStr"] <= rank_end_date
+            )
+            rank_net = df_broker.loc[rank_mask, "買賣超_Final"].sum()
+            if rank_net > 0:
+                add_note(notes, f"統計區間累計買超 {rank_net:,.0f} 張，主力有加碼跡象。")
+            elif rank_net < 0:
+                add_note(notes, f"統計區間累計賣超 {abs(rank_net):,.0f} 張，需留意調節壓力。")
+        else:
+            add_note(notes, "未提供統計區間，僅供日線籌碼參考。")
+
+        # 庫存變化：兩週累計
+        if len(df_broker) >= 10:
+            net_diff = df_broker["cumulative_net"].iloc[-1] - df_broker["cumulative_net"].iloc[-10]
+            if net_diff > 0:
+                add_note(notes, "近兩週庫存累積向上，買盤逐步增加。")
+            elif net_diff < 0:
+                add_note(notes, "近兩週庫存下降，分點正在出貨或降風險。")
+
+    if not notes:
+        add_note(notes, "資料正常但尚無明確方向，請搭配其他指標。")
+
+    return notes
 
 # ================= 4. 介面邏輯 =================
 
@@ -554,6 +650,12 @@ if stock_input:
                             st.warning("⚠️ 該券商明細抓取失敗，先顯示純股價")
                 else:
                     merged_df = st.session_state.get('merged_df')
+
+            strategy_notes = build_strategy_notes(merged_df, df_price, rank_start_date, rank_end_date)
+
+            st.markdown("#### 🧭 策略備註")
+            for note in strategy_notes:
+                st.markdown(f"- {note}")
 
             # 安全更新函式
             def safe_update_yaxes(fig, row, col, **kwargs):
