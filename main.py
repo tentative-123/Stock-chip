@@ -551,7 +551,13 @@ def compute_backtest_for_broker(
     if broker_df is None or broker_df.empty:
         return None
 
-    price_df = df_price[['DateStr', 'Close']].reset_index(drop=True)
+    price_df = (
+        df_price[['DateStr', 'Close']]
+        .dropna(subset=['DateStr'])
+        .drop_duplicates(subset=['DateStr'], keep='last')
+        .sort_values('DateStr')
+        .reset_index(drop=True)
+    )
     price_idx = {d: i for i, d in enumerate(price_df['DateStr'])}
 
     broker_df = broker_df.copy()
