@@ -423,10 +423,233 @@ def get_stock_price(stock_id):
         df['MA10'] = df['Close'].rolling(window=10).mean()
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA60'] = df['Close'].rolling(window=60).mean()
-        
+
         return df
     except Exception:
         return None
+
+
+def build_strategy_notes(merged_df, df_price, rank_start_date, rank_end_date):
+    """根據分點籌碼與股價位置，產生簡短的策略備註。"""
+
+    def add_note(unique_notes, text):
+        if text and text not in unique_notes:
+            unique_notes.append(text)
+
+    notes = []
+
+    base_df = merged_df if merged_df is not None and not merged_df.empty else df_price
+    if base_df is None or base_df.empty:
+        return ["暫無足夠資料產生策略備註。"]
+
+    df = base_df.copy()
+    df["Date"] = pd.to_datetime(df.get("DateStr"), errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date")
+
+    last_row = df.iloc[-1]
+    last_close = pd.to_numeric(last_row.get("Close"), errors="coerce")
+    ma20 = pd.to_numeric(last_row.get("MA20"), errors="coerce")
+    ma60 = pd.to_numeric(last_row.get("MA60"), errors="coerce")
+
+    # 1) 股價位置與均線排列
+    if pd.notna(last_close) and pd.notna(ma20) and pd.notna(ma60):
+        if last_close >= ma20 >= ma60:
+            add_note(notes, "股價在月/季線之上，均線多頭排列，偏多續看。")
+        elif last_close >= ma20 and last_close < ma60:
+            add_note(notes, "股價介於月線與季線，短線撐在月線但中期仍需觀察。")
+        elif last_close >= ma60 and last_close < ma20:
+            add_note(notes, "股價站季線但壓在月線下，若能回到月線上方偏多。")
+        else:
+            add_note(notes, "股價跌破月/季線，下檔需嚴控風險或等待止穩。")
+    elif pd.notna(last_close) and pd.notna(ma20):
+        add_note(notes, "股價相對月線仍具參考價值，建議密切追蹤月線攻防。")
+
+    # 均線角度輔助判斷（使用近 5 日斜率）
+    if len(df) >= 6 and pd.notna(df["MA20"].iloc[-1]):
+        ma20_slope = pd.to_numeric(df["MA20"].iloc[-1] - df["MA20"].iloc[-6], errors="coerce")
+        if pd.notna(ma20_slope):
+            if ma20_slope > 0:
+                add_note(notes, "月線近一週走升，趨勢動能偏正向。")
+            elif ma20_slope < 0:
+                add_note(notes, "月線近一週下彎，攻擊需提防轉弱。")
+
+    # 2) 分點買賣超趨勢
+    if merged_df is not None and not merged_df.empty and "買賣超_Final" in merged_df.columns:
+        df_broker = merged_df.copy()
+        df_broker["Date"] = pd.to_datetime(df_broker.get("DateStr"), errors="coerce")
+        df_broker = df_broker.dropna(subset=["Date"]).sort_values("Date")
+        df_broker["買賣超_Final"] = pd.to_numeric(df_broker.get("買賣超_Final", 0), errors="coerce").fillna(0)
+        df_broker["cumulative_net"] = pd.to_numeric(df_broker.get("cumulative_net", 0), errors="coerce")
+
+        # 近五日資金
+        recent_5 = df_broker.tail(5)["買賣超_Final"].sum()
+        if recent_5 > 0:
+            add_note(notes, f"近五日累計買超 {recent_5:,.0f} 張，短線資金偏多。")
+        elif recent_5 < 0:
+            add_note(notes, f"近五日累計賣超 {abs(recent_5):,.0f} 張，短線偏空或獲利了結。")
+
+        # 連續買賣超判讀
+        tail_net = df_broker["買賣超_Final"].tail(3)
+        if len(tail_net) == 3:
+            if (tail_net > 0).all():
+                add_note(notes, "分點連續 3 日買超，觀察是否帶動股價同步走高。")
+            elif (tail_net < 0).all():
+                add_note(notes, "分點連續 3 日賣超，留意籌碼鬆動或短線修正。")
+
+        # 排名區間籌碼
+        if rank_start_date and rank_end_date:
+            rank_mask = (
+                df_broker["DateStr"] >= rank_start_date
+            ) & (
+                df_broker["DateStr"] <= rank_end_date
+            )
+            rank_net = df_broker.loc[rank_mask, "買賣超_Final"].sum()
+            if rank_net > 0:
+                add_note(notes, f"統計區間累計買超 {rank_net:,.0f} 張，主力有加碼跡象。")
+            elif rank_net < 0:
+                add_note(notes, f"統計區間累計賣超 {abs(rank_net):,.0f} 張，需留意調節壓力。")
+        else:
+            add_note(notes, "未提供統計區間，僅供日線籌碼參考。")
+
+        # 庫存變化：兩週累計
+        if len(df_broker) >= 10:
+            net_diff = df_broker["cumulative_net"].iloc[-1] - df_broker["cumulative_net"].iloc[-10]
+            if net_diff > 0:
+                add_note(notes, "近兩週庫存累積向上，買盤逐步增加。")
+            elif net_diff < 0:
+                add_note(notes, "近兩週庫存下降，分點正在出貨或降風險。")
+
+    if not notes:
+        add_note(notes, "資料正常但尚無明確方向，請搭配其他指標。")
+
+    return notes
+
+
+def compute_backtest_for_broker(
+    broker_name,
+    broker_params,
+    stock_id,
+    df_price,
+    hold_days,
+    min_net,
+    min_streak,
+    direction,
+    refresh_nonce,
+    start_date=None,
+    end_date=None,
+):
+    """取得單一券商的回測統計，支援限定統計區間。"""
+
+    BHID = broker_params['BHID']
+    b = broker_params['b']
+    c_val = broker_params.get('C', '1')
+
+    long_start_date = df_price['DateStr'].iloc[0]
+    long_end_date = df_price['DateStr'].iloc[-1]
+
+    broker_df, _ = get_specific_broker_daily(stock_id, (BHID, b, c_val), long_start_date, long_end_date, refresh_nonce)
+    if broker_df is None or broker_df.empty:
+        return None
+
+    price_df = df_price[['DateStr', 'Close']].reset_index(drop=True)
+    price_idx = {d: i for i, d in enumerate(price_df['DateStr'])}
+
+    broker_df = broker_df.copy()
+    broker_df['Date'] = pd.to_datetime(broker_df['DateStr'], errors='coerce')
+    broker_df = broker_df.dropna(subset=['Date']).sort_values('Date')
+    broker_df = broker_df.drop_duplicates(subset=['DateStr'], keep='last')
+
+    if start_date:
+        broker_df = broker_df[broker_df['DateStr'] >= start_date]
+    if end_date:
+        broker_df = broker_df[broker_df['DateStr'] <= end_date]
+
+    if broker_df.empty:
+        return None
+
+    broker_df['買賣超_Calc'] = pd.to_numeric(broker_df.get('買賣超_Calc', 0), errors='coerce').fillna(0)
+    if direction == 'buy':
+        cond = broker_df['買賣超_Calc'] >= min_net
+    else:
+        cond = broker_df['買賣超_Calc'] <= -abs(min_net)
+
+    streak = cond.groupby((~cond).cumsum()).cumsum()
+    broker_df['signal'] = cond & (streak >= min_streak)
+
+    holds_result = {h: {'wins': 0, 'total': 0} for h in hold_days}
+    for _, row in broker_df[broker_df['signal']].iterrows():
+        date_str = row['DateStr']
+        entry_idx = price_idx.get(date_str)
+        if entry_idx is None:
+            continue
+
+        entry_price = price_df.loc[entry_idx, 'Close']
+        for h in hold_days:
+            future_idx = entry_idx + h
+            if future_idx >= len(price_df):
+                continue
+
+            future_price = price_df.loc[future_idx, 'Close']
+            pct = (future_price - entry_price) / entry_price
+            win = pct > 0 if direction == 'buy' else pct < 0
+            holds_result[h]['wins'] += int(win)
+            holds_result[h]['total'] += 1
+
+    # 無任何訊號則跳過該券商
+    if all(v['total'] == 0 for v in holds_result.values()):
+        return None
+
+    return {
+        'broker': broker_name,
+        'direction': direction,
+        'holds': holds_result
+    }
+
+
+def summarize_backtests(results, hold_days):
+    """彙總多個券商的勝率。"""
+    if not results:
+        return None, None
+
+    summary = {h: {'wins': 0, 'total': 0} for h in hold_days}
+    rows = []
+
+    for r in results:
+        if r is None:
+            continue
+
+        row = {
+            '券商': r['broker'],
+            '方向': '買超' if r['direction'] == 'buy' else '賣超'
+        }
+
+        for h in hold_days:
+            wins = r['holds'][h]['wins']
+            total = r['holds'][h]['total']
+            summary[h]['wins'] += wins
+            summary[h]['total'] += total
+
+            if total == 0:
+                row[f"{h}日勝率"] = "-"
+            else:
+                row[f"{h}日勝率"] = f"{wins / total:.1%} ({wins}/{total})"
+
+        rows.append(row)
+
+    summary_rows = []
+    for h in hold_days:
+        wins, total = summary[h]['wins'], summary[h]['total']
+        rate_text = "-" if total == 0 else f"{wins / total:.1%}"
+        summary_rows.append({
+            '持有天數': f"{h}日",
+            '總樣本數': total,
+            '勝率': rate_text
+        })
+
+    if not rows:
+        return None, None
+
+    return pd.DataFrame(rows), pd.DataFrame(summary_rows)
 
 # ================= 4. 介面邏輯 =================
 
@@ -554,6 +777,87 @@ if stock_input:
                             st.warning("⚠️ 該券商明細抓取失敗，先顯示純股價")
                 else:
                     merged_df = st.session_state.get('merged_df')
+
+            strategy_notes = build_strategy_notes(merged_df, df_price, rank_start_date, rank_end_date)
+
+            st.markdown("#### 🧭 策略備註")
+            for note in strategy_notes:
+                st.markdown(f"- {note}")
+
+            st.markdown("#### 🎯 前三大分點勝率回測 (試算)")
+            with st.expander("設定與說明", expanded=False):
+                top_n = st.slider("挑選前幾大買/賣超券商", min_value=1, max_value=5, value=3, step=1, help="依區間排行取前幾名參與回測")
+                min_net = st.number_input("單日買賣超門檻 (張)", min_value=10, max_value=5000, value=200, step=10, help="大於此門檻才記為訊號")
+                min_streak = st.slider("連續滿足天數", min_value=1, max_value=5, value=2, help="連續滿足門檻的天數才觸發進場")
+                hold_days = st.multiselect("回測持有天數", [3, 5, 10, 20], default=[5, 10], help="可同時查看多種持有週期的勝率")
+                directions = st.multiselect("回測方向", ["買超", "賣超"], default=["買超", "賣超"], help="買超代表看多；賣超代表觀察放空/避開")
+
+            if hold_days:
+                broker_targets = []
+                missing_params = []
+
+                if "買超" in directions:
+                    for name in df_buy.head(top_n)['broker']:
+                        key = normalize_name(name)
+                        params = broker_info.get(key)
+                        if not params:
+                            for k, v in broker_info.items():
+                                if key in k or k in key:
+                                    params = v
+                                    break
+                        if params:
+                            broker_targets.append((name, params, 'buy'))
+                        else:
+                            missing_params.append(name)
+
+                if "賣超" in directions:
+                    for name in df_sell.head(top_n)['broker']:
+                        key = normalize_name(name)
+                        params = broker_info.get(key)
+                        if not params:
+                            for k, v in broker_info.items():
+                                if key in k or k in key:
+                                    params = v
+                                    break
+                        if params:
+                            broker_targets.append((name, params, 'sell'))
+                        else:
+                            missing_params.append(name)
+
+                if broker_targets:
+                    with st.spinner("回測中（抓取券商日明細，請稍候）..."):
+                        backtest_results = [
+                            compute_backtest_for_broker(
+                                name,
+                                params,
+                                stock_input,
+                                df_price,
+                                hold_days,
+                                min_net,
+                                min_streak,
+                                direction,
+                                st.session_state.refresh_nonce,
+                                start_date=rank_start_date,
+                                end_date=rank_end_date,
+                            )
+                            for name, params, direction in broker_targets
+                        ]
+
+                    detail_df, summary_df = summarize_backtests(backtest_results, hold_days)
+
+                    if detail_df is not None and not detail_df.empty:
+                        st.caption(f"統計期間：{rank_start_date} ~ {rank_end_date}")
+                        st.dataframe(detail_df, use_container_width=True)
+                    else:
+                        st.info("所選區間內沒有符合條件的進場樣本。")
+                    if summary_df is not None and not summary_df.empty:
+                        st.caption("整體勝率彙總")
+                        st.dataframe(summary_df, use_container_width=True)
+
+                if missing_params:
+                    st.warning("以下券商缺少網址參數，無法回測：" + ", ".join(missing_params))
+            else:
+                st.info("請至少選擇一個持有天數進行回測。")
 
             # 安全更新函式
             def safe_update_yaxes(fig, row, col, **kwargs):
